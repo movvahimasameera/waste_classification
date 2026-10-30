@@ -1,143 +1,140 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Tuple
 
+import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
-from PIL import Image, ImageOps
+from PIL import Image
+from skimage.color import rgb2gray, rgb2hsv
+from skimage.feature import hog, local_binary_pattern
 
-try:
-    import tensorflow as tf
-    from tensorflow.keras import layers
-    from tensorflow.keras.applications import MobileNetV2
-    from tensorflow.keras.models import Model
-except ImportError:
-    tf = None
-    MobileNetV2 = None
-    Model = None
-    layers = None
-
-DATASET_DIR = Path("realwaste-main/RealWaste")
-MODEL_PATH = Path("models/waste_classifier.keras")
-IMAGE_SIZE = (224, 224)
-MAX_EPOCHS = 8
-
-
-@st.cache_data
-def get_class_names() -> list[str]:
-    if not DATASET_DIR.exists():
-        return []
-    return sorted(
-        entry.name for entry in DATASET_DIR.iterdir() if entry.is_dir()
-    )
+PROJECT_DIR = Path(__file__).resolve().parent
+DATASET_DIR = PROJECT_DIR / "realwaste-main" / "RealWaste"
+MODEL_PATH = PROJECT_DIR / "models" / "waste_classifier.joblib"
+IMAGE_SIZE = (128, 128)
 
 
 @st.cache_resource
-def get_model(class_names: list[str]):
-    if tf is None:
-        raise RuntimeError("TensorFlow is not installed. Install it with `pip install tensorflow`.")
-
-    if MODEL_PATH.exists():
-        return tf.keras.models.load_model(MODEL_PATH)
-
-    if not DATASET_DIR.exists():
+def load_model_bundle() -> dict:
+    if not MODEL_PATH.is_file():
         raise FileNotFoundError(
-            "Dataset folder not found. Expected 'realwaste-main/RealWaste'."
+            f"Model artifact not found at {MODEL_PATH}. "
+            "Train the model in waste_classification.ipynb and run its "
+            "model-export cell before deploying."
         )
 
-    train_ds = tf.keras.utils.image_dataset_from_directory(
-        DATASET_DIR,
-        validation_split=0.2,
-        subset="training",
-        seed=42,
-        image_size=IMAGE_SIZE,
-        batch_size=32,
-        label_mode="categorical",
+    bundle = joblib.load(MODEL_PATH)
+    if not isinstance(bundle, dict):
+        raise TypeError("The model artifact must contain a dictionary bundle.")
+
+    model = bundle.get("model")
+    scaler = bundle.get("scaler")
+    class_names = bundle.get("class_names")
+    if not callable(getattr(model, "predict_proba", None)):
+        raise TypeError("The saved classifier must support predict_proba().")
+    if not callable(getattr(scaler, "transform", None)):
+        raise TypeError("The saved feature scaler must support transform().")
+    if not isinstance(class_names, list) or not all(
+        isinstance(name, str) for name in class_names
+    ):
+        raise TypeError("The model artifact must include a list of class names.")
+    model_classes = getattr(model, "classes_", None)
+    if model_classes is None or len(model_classes) != len(class_names):
+        raise ValueError("The saved classifier and class-name list do not match.")
+    if any(
+        not isinstance(class_index, (int, np.integer))
+        or class_index < 0
+        or class_index >= len(class_names)
+        for class_index in model_classes
+    ):
+        raise ValueError("The saved classifier contains invalid class indexes.")
+
+    return bundle
+
+
+def extract_features(image: Image.Image) -> np.ndarray:
+    image = image.convert("RGB").resize(
+        IMAGE_SIZE,
+        resample=Image.Resampling.BICUBIC,
     )
-    val_ds = tf.keras.utils.image_dataset_from_directory(
-        DATASET_DIR,
-        validation_split=0.2,
-        subset="validation",
-        seed=42,
-        image_size=IMAGE_SIZE,
-        batch_size=32,
-        label_mode="categorical",
-    )
+    pixels = np.asarray(image)
+    gray = rgb2gray(pixels)
 
-    AUTOTUNE = tf.data.AUTOTUNE
-    train_ds = train_ds.prefetch(buffer_size=AUTOTUNE)
-    val_ds = val_ds.prefetch(buffer_size=AUTOTUNE)
-
-    base_model = MobileNetV2(
-        input_shape=(IMAGE_SIZE[0], IMAGE_SIZE[1], 3),
-        include_top=False,
-        weights="imagenet",
-    )
-    base_model.trainable = False
-
-    inputs = tf.keras.Input(shape=(IMAGE_SIZE[0], IMAGE_SIZE[1], 3))
-    x = tf.keras.applications.mobilenet_v2.preprocess_input(inputs)
-    x = base_model(x, training=False)
-    x = layers.GlobalAveragePooling2D()(x)
-    x = layers.Dropout(0.3)(x)
-    outputs = layers.Dense(len(class_names), activation="softmax")(x)
-    model = Model(inputs, outputs)
-
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
-        loss="categorical_crossentropy",
-        metrics=["accuracy"],
-    )
-
-    early_stop = tf.keras.callbacks.EarlyStopping(
-        monitor="val_loss",
-        patience=2,
-        restore_best_weights=True,
+    shape_features = hog(
+        gray,
+        orientations=9,
+        pixels_per_cell=(16, 16),
+        cells_per_block=(2, 2),
     )
 
-    history = model.fit(
-        train_ds,
-        validation_data=val_ds,
-        epochs=MAX_EPOCHS,
-        callbacks=[early_stop],
-        verbose=1,
+    hsv = rgb2hsv(pixels)
+    quarters = (
+        hsv[:64, :64],
+        hsv[:64, 64:],
+        hsv[64:, :64],
+        hsv[64:, 64:],
+    )
+    color_features = []
+    for quarter in quarters:
+        for channel in range(3):
+            values = quarter[:, :, channel]
+            histogram, _ = np.histogram(
+                values,
+                bins=8,
+                range=(0, 1),
+                density=True,
+            )
+            color_features.extend(histogram)
+            color_features.extend((values.mean(), values.std()))
+
+    lbp = local_binary_pattern(
+        (gray * 255).astype(np.uint8),
+        8,
+        1,
+        method="uniform",
+    )
+    texture_features, _ = np.histogram(
+        lbp,
+        bins=10,
+        range=(0, 10),
+        density=True,
     )
 
-    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    model.save(MODEL_PATH)
-    return model
+    return np.concatenate(
+        (shape_features, color_features, texture_features)
+    ).reshape(1, -1)
 
 
-@st.cache_data
-def get_sample_images(class_names: list[str]):
-    sample_paths = []
-    for class_name in class_names:
-        class_dir = DATASET_DIR / class_name
-        images = sorted(class_dir.glob("*.*"))
-        if images:
-            sample_paths.append(images[0])
-    return sample_paths
+def predict_image(
+    bundle: dict,
+    image: Image.Image,
+) -> pd.DataFrame:
+    features = extract_features(image)
+    scaled_features = bundle["scaler"].transform(features)
+    probabilities = bundle["model"].predict_proba(scaled_features)[0]
+    class_names = bundle["class_names"]
+    model_classes = bundle["model"].classes_
 
+    if len(probabilities) != len(model_classes):
+        raise ValueError("The model returned an invalid probability result.")
 
-def prepare_image(image: Image.Image) -> np.ndarray:
-    image = ImageOps.fit(image.convert("RGB"), (IMAGE_SIZE[0], IMAGE_SIZE[1]), method=Image.Resampling.LANCZOS)
-    image_array = np.asarray(image, dtype=np.float32) / 255.0
-    return np.expand_dims(image_array, axis=0)
-
-
-def predict_single(model, image: Image.Image, class_names: list[str]):
-    prepared = prepare_image(image)
-    probs = model.predict(prepared, verbose=0)[0]
     predictions = pd.DataFrame(
         {
-            "class": class_names,
-            "probability": [float(p) for p in probs],
+            "class": [
+                class_names[int(class_index)] for class_index in model_classes
+            ],
+            "probability": probabilities.astype(float),
         }
-    ).sort_values("probability", ascending=False)
-    top_prediction = predictions.iloc[0]
-    return predictions, top_prediction
+    )
+    return predictions.sort_values("probability", ascending=False)
+
+
+def get_sample_images(class_name: str) -> list[Path]:
+    if not DATASET_DIR.is_dir():
+        return []
+    return sorted((DATASET_DIR / class_name).glob("*.*"))
 
 
 def main() -> None:
@@ -145,60 +142,54 @@ def main() -> None:
     st.title("♻️ Waste Classification App")
     st.caption("Classify waste images into the categories in the RealWaste dataset.")
 
-    class_names = get_class_names()
-    if not class_names:
-        st.error(
-            "The dataset folder was not found. Please ensure 'realwaste-main/RealWaste' exists in the project root."
-        )
-        st.stop()
-
-    st.sidebar.title("Training and model")
-    st.sidebar.write(f"Detected classes: {len(class_names)}")
-    st.sidebar.write(", ".join(class_names))
-    st.sidebar.markdown("---")
-    st.sidebar.write("The app will train a lightweight MobileNetV2 model on first run if no saved model is available.")
-
     try:
-        model = get_model(class_names)
-    except Exception as exc:
-        st.error(f"Model setup failed: {exc}")
+        bundle = load_model_bundle()
+    except FileNotFoundError as exc:
+        st.error(str(exc))
         st.stop()
 
-    source = st.radio("Choose input type", ["Upload an image", "Use a sample image"], horizontal=True)
+    class_names = bundle["class_names"]
+    st.sidebar.title("Model")
+    st.sidebar.write(f"Loaded classifier with {len(class_names)} waste categories.")
 
+    sources = ["Upload an image"]
+    if DATASET_DIR.is_dir():
+        sources.append("Use a sample image")
+    source = st.radio("Choose input type", sources, horizontal=True)
+
+    image = None
     if source == "Upload an image":
-        uploaded_file = st.file_uploader("Upload a waste image", type=["png", "jpg", "jpeg"])
+        uploaded_file = st.file_uploader(
+            "Upload a waste image",
+            type=["png", "jpg", "jpeg"],
+        )
         if uploaded_file is not None:
             image = Image.open(uploaded_file)
-            st.image(image, caption="Uploaded image", use_container_width=True)
-            clicked = st.button("Predict waste type")
-            if clicked:
-                predictions, top_prediction = predict_single(model, image, class_names)
-                st.subheader("Prediction")
-                st.success(f"Predicted category: {top_prediction['class']}")
-                st.write(f"Confidence: {top_prediction['probability'] * 100:.2f}%")
-                st.dataframe(predictions.head(9), use_container_width=True)
-        else:
-            st.info("Please upload an image to classify.")
     else:
-        sample_paths = get_sample_images(class_names)
-        if not sample_paths:
-            st.warning("No sample images were found in the dataset.")
-            st.stop()
-
-        selected_label = st.selectbox("Choose a class", class_names)
-        class_dir = DATASET_DIR / selected_label
-        sample_files = sorted(class_dir.glob("*.*"))
-        selected_file = st.selectbox("Select a sample image", sample_files, format_func=lambda p: p.name)
+        selected_class = st.selectbox("Choose a class", class_names)
+        sample_files = get_sample_images(selected_class)
+        if not sample_files:
+            st.warning(f"No sample images were found for {selected_class}.")
+            return
+        selected_file = st.selectbox(
+            "Select a sample image",
+            sample_files,
+            format_func=lambda path: path.name,
+        )
         image = Image.open(selected_file)
-        st.image(image, caption=f"Sample from {selected_label}", use_container_width=True)
 
-        if st.button("Predict sample"):
-            predictions, top_prediction = predict_single(model, image, class_names)
-            st.subheader("Prediction")
-            st.success(f"Predicted category: {top_prediction['class']}")
-            st.write(f"Confidence: {top_prediction['probability'] * 100:.2f}%")
-            st.dataframe(predictions.head(9), use_container_width=True)
+    if image is None:
+        st.info("Upload or select an image to classify.")
+        return
+
+    st.image(image, caption="Image to classify", use_container_width=True)
+    if st.button("Predict waste type"):
+        predictions = predict_image(bundle, image)
+        top_prediction = predictions.iloc[0]
+        st.subheader("Prediction")
+        st.success(f"Predicted category: {top_prediction['class']}")
+        st.write(f"Confidence: {top_prediction['probability'] * 100:.2f}%")
+        st.dataframe(predictions, use_container_width=True)
 
 
 if __name__ == "__main__":
